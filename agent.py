@@ -211,11 +211,11 @@ async def run_agent():
             # We try multiple selectors because the page might render differently
             log("THINK", "Step 4 — Looking for the Name field")
             name_selectors = [
-                "input#name",                          # exact ID match
-                "input[name='username']",              # by name attribute
-                "input[placeholder*='shadcn']",        # placeholder text hint
-                "form input[type='text']:first-of-type",  # first text input in a form
-                "input[type='text']",                  # any text input as fallback
+                "input[name='username']",              # shadcn form uses name='username' for the Name field
+                "input#name",                          # some versions use id='name'
+                "input[placeholder*='shadcn']",        # placeholder text fallback
+                "form input[type='text']:first-of-type",  # first text input in the form
+                "input[type='text']",                  # last resort — any text input
             ]
             name_field = await find_element(page, name_selectors, "Name field")
 
@@ -223,8 +223,8 @@ async def run_agent():
                 log("THINK", "Step 5 — Clicking the Name field and typing")
                 await name_field.click()
                 await page.wait_for_timeout(300)
-                # clear any existing text first with triple-click
-                await name_field.triple_click()
+                # triple-click selects all the text so we can overwrite it cleanly
+                await name_field.click(click_count=3)
                 await send_keys(page, FILL_NAME, selector=None)
                 await take_screenshot(page, "03_name_filled")
                 log("OBSERVE", f"Name field filled with: '{FILL_NAME}'")
@@ -235,10 +235,10 @@ async def run_agent():
             # STEP 5: Find the Description textarea
             log("THINK", "Step 6 — Looking for the Description field")
             desc_selectors = [
-                "textarea#bio",                      # ID used in shadcn form example
-                "textarea[name='bio']",              # name attribute
+                "textarea[name='bio']",              # shadcn form uses name='bio' for the description
+                "textarea#bio",                      # some versions use id='bio'
                 "textarea",                          # any textarea on the page
-                "input[name='description']",         # sometimes it's an input
+                "input[name='description']",         # fallback if it's a plain input
             ]
             desc_field = await find_element(page, desc_selectors, "Description field")
 
@@ -246,7 +246,7 @@ async def run_agent():
                 log("THINK", "Step 7 — Clicking the Description field and typing")
                 await desc_field.click()
                 await page.wait_for_timeout(300)
-                await desc_field.triple_click()
+                await desc_field.click(click_count=3)
                 await send_keys(page, FILL_DESC, selector=None)
                 await take_screenshot(page, "04_desc_filled")
                 log("OBSERVE", f"Description field filled with: '{FILL_DESC}'")

@@ -195,9 +195,9 @@ async function run_agent() {
         // STEP 4: Find and fill the Name input
         log('THINK', 'Step 4 — Looking for the Name field');
         const nameField = await find_element(page, [
-            'input#name',
-            "input[name='username']",
-            "input[placeholder*='shadcn']",
+            "input[name='username']",              // shadcn form uses name='username' for the Name field
+            'input#name',                          // some versions use id='name'
+            "input[placeholder*='shadcn']",        // placeholder hint
             'form input[type="text"]:first-of-type',
             'input[type="text"]',
         ], 'Name field');
@@ -218,9 +218,9 @@ async function run_agent() {
         // STEP 5: Find and fill the Description textarea
         log('THINK', 'Step 6 — Looking for the Description field');
         const descField = await find_element(page, [
-            'textarea#bio',
-            "textarea[name='bio']",
-            'textarea',
+            "textarea[name='bio']",    // shadcn uses name='bio' for description
+            'textarea#bio',            // some versions use id='bio'
+            'textarea',                // any textarea
             "input[name='description']",
         ], 'Description field');
 
