@@ -1,0 +1,2 @@
+# This file just makes git track the screenshots/ folder.
+# Actual screenshots are in .gitignore so they don't get committed.

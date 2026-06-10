@@ -14,7 +14,7 @@ npm-debug.log*
 # playwright stuff
 test-results/
 playwright-report/
-screenshots/
+screenshots/*.png
 
 # env files - never commit real keys
 .env
