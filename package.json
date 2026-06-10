@@ -1,0 +1,18 @@
+{
+  "name": "website-automation-agent",
+  "version": "1.0.0",
+  "description": "Browser automation agent that fills forms using Playwright",
+  "type": "module",
+  "main": "agent.js",
+  "scripts": {
+    "start": "node agent.js",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "playwright": "^1.49.0"
+  },
+  "keywords": ["automation", "playwright", "ai-agent", "browser"],
+  "author": "Tanishq Singh",
+  "license": "ISC"
+}

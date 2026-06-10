@@ -1,0 +1,27 @@
+# python stuff
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# node stuff
+node_modules/
+npm-debug.log*
+
+# playwright stuff
+test-results/
+playwright-report/
+screenshots/
+
+# env files - never commit real keys
+.env
+
+# mac junk
+.DS_Store
+
+# logs
+logs/
+*.log
