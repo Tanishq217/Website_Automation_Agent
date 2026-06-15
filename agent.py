@@ -1,299 +1,467 @@
 """
-Website Automation Agent
-------------------------
-This is the main agent. It uses Playwright to open a browser,
-navigate to a URL, find form fields on the page, and fill them in.
+Website Automation Agent — AI-Driven Version
+---------------------------------------------
+This is a real AI agent, not a script.
 
-Think of it like a robot that knows how to use a browser,
-but instead of clicking around randomly, it knows exactly
-what tools to use at each step.
+Instead of hardcoding which elements to click, we:
+1. Take a screenshot + read the page DOM at each step
+2. Send that info to an LLM and ask "what should I do next?"
+3. The LLM returns a tool call as JSON
+4. We execute it
+5. Repeat until the LLM says "done"
 
-Run it with: python agent.py
+This is called the ReAct pattern (Reasoning + Acting in a loop).
+
+LLM used: meta/llama-3.1-8b-instruct via NVIDIA NIM API
+Browser:  Playwright (Chromium)
+
+Run with: python3 agent.py
 """
 
 import os
+import json
 import time
 import asyncio
+import base64
 from datetime import datetime
 from pathlib import Path
+
+from openai import OpenAI
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Page, Browser, TimeoutError as PlaywrightTimeout
 
-# load everything from .env before we do anything else
+# load .env before anything else
 load_dotenv()
 
-# grab config from environment
-TARGET_URL    = os.getenv("TARGET_URL",    "https://ui.shadcn.com/docs/forms/react-hook-form")
-FILL_NAME     = os.getenv("FILL_NAME",     "Tanishq Singh")
-FILL_DESC     = os.getenv("FILL_DESCRIPTION", "This form was auto-filled by a Playwright automation agent!")
-BROWSER_TYPE  = os.getenv("BROWSER",       "chromium")
-HEADLESS      = os.getenv("HEADLESS",      "false").lower() == "true"
-TIMEOUT_MS    = int(os.getenv("TIMEOUT",   "30000"))
+# --- config from environment ---
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+LLM_MODEL      = os.getenv("LLM_MODEL", "meta/llama-3.1-8b-instruct")
+TARGET_URL     = os.getenv("TARGET_URL", "https://ui.shadcn.com/docs/forms/react-hook-form")
+FILL_NAME      = os.getenv("FILL_NAME", "Tanishq Singh")
+FILL_DESC      = os.getenv("FILL_DESCRIPTION", "Auto-filled by AI agent!")
+BROWSER_TYPE   = os.getenv("BROWSER", "chromium")
+HEADLESS       = os.getenv("HEADLESS", "false").lower() == "true"
+TIMEOUT_MS     = int(os.getenv("TIMEOUT", "30000"))
+MAX_STEPS      = int(os.getenv("MAX_STEPS", "20"))
 
-# where screenshots get saved
+# screenshots go here
 SCREENSHOTS_DIR = Path("screenshots")
 SCREENSHOTS_DIR.mkdir(exist_ok=True)
 
+# --- NVIDIA NIM client (OpenAI-compatible API) ---
+if not NVIDIA_API_KEY:
+    print("[ERROR] NVIDIA_API_KEY not found in .env — please add it and try again.")
+    exit(1)
 
-# -------------------------------------------------------------------
-# LOGGING — simple colored terminal output so we can follow along
-# -------------------------------------------------------------------
+llm = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=NVIDIA_API_KEY
+)
+
+
+# =============================================================================
+# LOGGING — color-coded terminal output so you can follow what's happening
+# =============================================================================
 
 def log(tag: str, message: str):
     ts = datetime.now().strftime("%H:%M:%S")
     colors = {
-        "START":   "\033[96m",   # cyan
-        "THINK":   "\033[93m",   # yellow
-        "TOOL":    "\033[92m",   # green
-        "OBSERVE": "\033[94m",   # blue
-        "ERROR":   "\033[91m",   # red
-        "OUTPUT":  "\033[95m",   # purple
+        "START":   "\033[96m",
+        "THINK":   "\033[93m",
+        "LLM":     "\033[35m",
+        "TOOL":    "\033[92m",
+        "OBSERVE": "\033[94m",
+        "ERROR":   "\033[91m",
+        "OUTPUT":  "\033[95m",
     }
     reset = "\033[0m"
     color = colors.get(tag, "")
     print(f"[{ts}] {color}[{tag}]{reset}  {message}")
 
 
-# -------------------------------------------------------------------
-# TOOL: take_screenshot
-# Saves a PNG of whatever the browser is showing right now
-# -------------------------------------------------------------------
+# =============================================================================
+# THE 7 TOOLS — each does exactly one thing
+# The LLM decides which one to call and with what params
+# =============================================================================
 
-async def take_screenshot(page: Page, label: str = "screenshot") -> str:
-    filename = SCREENSHOTS_DIR / f"{label}_{int(time.time())}.png"
-    await page.screenshot(path=str(filename), full_page=False)
-    log("TOOL", f"take_screenshot → saved to {filename}")
-    return str(filename)
-
-
-# -------------------------------------------------------------------
-# TOOL: navigate_to_url
-# Points the browser at a specific URL and waits for the page to load
-# -------------------------------------------------------------------
-
-async def navigate_to_url(page: Page, url: str):
-    log("TOOL", f"navigate_to_url → {url}")
-    await page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-    # give any JS-rendered content a moment to appear
-    await page.wait_for_timeout(2000)
-    log("OBSERVE", f"Page loaded: {await page.title()}")
+async def take_screenshot(page: Page, label: str = "step") -> str:
+    """Saves a PNG of the current browser view and returns the file path."""
+    path = str(SCREENSHOTS_DIR / f"{label}_{int(time.time())}.png")
+    await page.screenshot(path=path, full_page=False)
+    log("TOOL", f"take_screenshot → {path}")
+    return path
 
 
-# -------------------------------------------------------------------
-# TOOL: scroll
-# Scrolls the page by a given number of pixels (positive = down)
-# -------------------------------------------------------------------
-
-async def scroll(page: Page, pixels: int = 400):
-    log("TOOL", f"scroll → {pixels}px")
-    await page.evaluate(f"window.scrollBy(0, {pixels})")
-    await page.wait_for_timeout(500)
-
-
-# -------------------------------------------------------------------
-# TOOL: click_on_screen
-# Clicks at exact (x, y) coordinates on the page
-# Useful when we know where something is visually
-# -------------------------------------------------------------------
-
-async def click_on_screen(page: Page, x: int, y: int):
-    log("TOOL", f"click_on_screen → ({x}, {y})")
-    await page.mouse.click(x, y)
-    await page.wait_for_timeout(300)
-
-
-# -------------------------------------------------------------------
-# TOOL: double_click
-# Double-clicks at (x, y) — needed to select all text in some fields
-# -------------------------------------------------------------------
-
-async def double_click(page: Page, x: int, y: int):
-    log("TOOL", f"double_click → ({x}, {y})")
-    await page.mouse.dblclick(x, y)
-    await page.wait_for_timeout(300)
-
-
-# -------------------------------------------------------------------
-# TOOL: send_keys
-# Types text into whatever element is currently focused
-# Can also target a specific selector
-# -------------------------------------------------------------------
-
-async def send_keys(page: Page, text: str, selector: str = None):
-    if selector:
-        log("TOOL", f"send_keys → '{text}' into selector: {selector}")
-        await page.locator(selector).fill(text)
-    else:
-        log("TOOL", f"send_keys → '{text}' (typing into focused element)")
-        await page.keyboard.type(text, delay=60)
-
-
-# -------------------------------------------------------------------
-# TOOL: open_browser
-# Spins up a Playwright browser instance and returns it + a new page
-# -------------------------------------------------------------------
-
-async def open_browser(playwright_instance) -> tuple:
-    log("TOOL", f"open_browser → launching {BROWSER_TYPE} (headless={HEADLESS})")
-
-    browser_map = {
-        "chromium": playwright_instance.chromium,
-        "firefox":  playwright_instance.firefox,
-        "webkit":   playwright_instance.webkit,
+async def open_browser(pw) -> tuple[Browser, Page]:
+    """Launches Chromium and returns (browser, page)."""
+    log("TOOL", f"open_browser → {BROWSER_TYPE} (headless={HEADLESS})")
+    launchers = {
+        "chromium": pw.chromium,
+        "firefox":  pw.firefox,
+        "webkit":   pw.webkit,
     }
-    launcher = browser_map.get(BROWSER_TYPE, playwright_instance.chromium)
-
-    browser: Browser = await launcher.launch(
+    browser = await launchers.get(BROWSER_TYPE, pw.chromium).launch(
         headless=HEADLESS,
         args=["--start-maximized"]
     )
-    context = await browser.new_context(
-        viewport={"width": 1440, "height": 900},
-        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0"
-    )
-    page = await context.new_page()
-    log("OBSERVE", "Browser launched and new page created")
+    ctx  = await browser.new_context(viewport={"width": 1440, "height": 900})
+    page = await ctx.new_page()
+    log("OBSERVE", "Browser ready")
     return browser, page
 
 
-# -------------------------------------------------------------------
-# SMART ELEMENT FINDER
-# Tries a list of selectors one by one until something works.
-# This is the "intelligent" part — if the first guess fails, we try more.
-# -------------------------------------------------------------------
+async def navigate_to_url(page: Page, url: str) -> str:
+    """Goes to the given URL and waits for it to load."""
+    log("TOOL", f"navigate_to_url → {url}")
+    await page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+    await page.wait_for_timeout(2500)  # let React render
+    title = await page.title()
+    log("OBSERVE", f"Loaded: {title}")
+    return f"Navigated to {url}. Page title: {title}"
 
-async def find_element(page: Page, selectors: list, description: str = "element"):
-    for selector in selectors:
+
+async def scroll(page: Page, pixels: int) -> str:
+    """Scrolls the page by 'pixels' (positive = down, negative = up)."""
+    log("TOOL", f"scroll → {pixels}px")
+    await page.evaluate(f"window.scrollBy(0, {pixels})")
+    await page.wait_for_timeout(600)
+    pos = await page.evaluate("window.scrollY")
+    return f"Scrolled {pixels}px. Current scroll position: {pos}px"
+
+
+async def click_on_screen(page: Page, x: int, y: int) -> str:
+    """Clicks at exact pixel coordinates (x, y)."""
+    log("TOOL", f"click_on_screen → ({x}, {y})")
+    await page.mouse.click(x, y)
+    await page.wait_for_timeout(400)
+    return f"Clicked at ({x}, {y})"
+
+
+async def double_click(page: Page, x: int, y: int) -> str:
+    """Double-clicks at (x, y)."""
+    log("TOOL", f"double_click → ({x}, {y})")
+    await page.mouse.dblclick(x, y)
+    await page.wait_for_timeout(400)
+    return f"Double-clicked at ({x}, {y})"
+
+
+async def send_keys(page: Page, selector: str, text: str) -> str:
+    """
+    Finds an element using the given CSS selector and types text into it.
+    Tries the selector first. If that fails, tries common fallbacks.
+    Returns a result string the LLM will read.
+    """
+    log("TOOL", f"send_keys → selector='{selector}' text='{text}'")
+
+    # build a fallback list starting with whatever the LLM suggested
+    fallbacks = [selector]
+
+    # add some general fallbacks in case the LLM's selector is slightly off
+    if "input" in selector.lower():
+        fallbacks += ["input[type='text']", "input"]
+    if "textarea" in selector.lower():
+        fallbacks += ["textarea"]
+
+    for sel in fallbacks:
         try:
-            locator = page.locator(selector).first
-            await locator.wait_for(state="visible", timeout=5000)
-            log("OBSERVE", f"Found '{description}' using selector: {selector}")
-            return locator
-        except PlaywrightTimeout:
-            log("THINK", f"Selector not found: {selector} — trying next...")
+            elem = page.locator(sel).first
+            await elem.wait_for(state="visible", timeout=5000)
+            await elem.click(click_count=3)  # triple-click selects all existing text
+            await page.wait_for_timeout(200)
+            await page.keyboard.type(text, delay=50)
+            await page.wait_for_timeout(300)
+            log("OBSERVE", f"Typed into '{sel}' successfully")
+            return f"SUCCESS: Typed '{text}' into element matching '{sel}'"
         except Exception as e:
-            log("THINK", f"Selector error ({selector}): {e} — trying next...")
-    return None
+            log("THINK", f"Selector '{sel}' failed: {e}")
+
+    return f"FAILED: Could not find any element matching '{selector}' or fallbacks. Try a different selector."
 
 
-# -------------------------------------------------------------------
-# THE MAIN AGENT LOOP
-# This is where the agent actually thinks and acts.
-# It follows: START → THINK → TOOL → OBSERVE → OUTPUT
-# -------------------------------------------------------------------
+# =============================================================================
+# PAGE CONTEXT EXTRACTOR
+# Gets relevant info from the current page to give to the LLM.
+# The LLM uses this to decide which selectors to use — nothing is hardcoded.
+# =============================================================================
+
+async def get_page_context(page: Page) -> dict:
+    """
+    Reads the live DOM and returns a clean summary:
+    - All inputs/textareas/buttons with their attributes
+    - All labels on the page
+    - Current scroll position
+    This is what the LLM "sees" when deciding what to do.
+    """
+    title = await page.title()
+    url   = page.url
+
+    elements = await page.evaluate("""() => {
+        const result = { inputs: [], labels: [], buttons: [] };
+
+        document.querySelectorAll('input, textarea').forEach(el => {
+            result.inputs.push({
+                tag:         el.tagName.toLowerCase(),
+                type:        el.getAttribute('type') || '',
+                name:        el.getAttribute('name') || '',
+                id:          el.id || '',
+                placeholder: el.placeholder || '',
+                value:       el.value || '',
+                visible:     el.offsetParent !== null
+            });
+        });
+
+        document.querySelectorAll('label').forEach(el => {
+            result.labels.push({
+                text:    el.textContent.trim().substring(0, 80),
+                htmlFor: el.htmlFor || ''
+            });
+        });
+
+        document.querySelectorAll('button').forEach(el => {
+            result.buttons.push({
+                text: el.textContent.trim().substring(0, 60),
+                type: el.getAttribute('type') || 'button'
+            });
+        });
+
+        return result;
+    }""")
+
+    scroll_y = await page.evaluate("window.scrollY")
+
+    return {
+        "title":    title,
+        "url":      url,
+        "scroll_y": scroll_y,
+        "inputs":   elements["inputs"],
+        "labels":   elements["labels"],
+        "buttons":  elements["buttons"],
+    }
+
+
+# =============================================================================
+# LLM DECISION MAKER
+# This is what makes the agent "intelligent".
+# It sends the current page state + task + history to the LLM,
+# and the LLM returns the next tool to call.
+# =============================================================================
+
+SYSTEM_PROMPT = """You are an expert browser automation agent.
+
+Your job is to complete a given task by controlling a web browser step by step.
+
+You have these tools available:
+- navigate_to_url  : params: { url }
+- scroll           : params: { pixels }  (positive = down, negative = up)
+- click_on_screen  : params: { x, y }   (pixel coordinates)
+- double_click     : params: { x, y }
+- send_keys        : params: { selector, text }  (CSS selector + text to type)
+- take_screenshot  : params: {}
+- done             : params: { message }  (call this when the task is fully complete)
+
+IMPORTANT RULES:
+1. Always respond with ONLY valid JSON — no markdown, no explanation outside the JSON.
+2. Format: {"reasoning": "...", "tool": "tool_name", "params": {...}}
+3. For send_keys, choose the MOST SPECIFIC CSS selector based on the page elements given.
+   Prefer selectors like input[name='x'] or textarea[id='y'] over generic ones like 'input'.
+4. Scroll down to find elements that might be below the fold.
+5. After filling all required fields, click the submit button.
+6. Once the form is submitted, call the done tool.
+7. If a send_keys attempt failed (you'll see FAILED in the result), try a different selector.
+"""
+
+def ask_llm(task: str, page_context: dict, history: list) -> dict:
+    """
+    Sends the current situation to the LLM and gets back a tool call.
+    Returns a dict like: { "reasoning": "...", "tool": "scroll", "params": {"pixels": 400} }
+    """
+    # build a readable context string from the page state
+    ctx_lines = [
+        f"Title: {page_context['title']}",
+        f"URL: {page_context['url']}",
+        f"Scroll position: {page_context['scroll_y']}px",
+        "",
+        "Form inputs and textareas found on page:",
+    ]
+    for el in page_context["inputs"]:
+        visible = "visible" if el["visible"] else "not visible (below fold)"
+        ctx_lines.append(
+            f"  - <{el['tag']}> type={el['type']!r} name={el['name']!r} "
+            f"id={el['id']!r} placeholder={el['placeholder']!r} ({visible})"
+        )
+
+    ctx_lines.append("\nLabels:")
+    for lb in page_context["labels"]:
+        ctx_lines.append(f"  - {lb['text']!r} (for={lb['htmlFor']!r})")
+
+    ctx_lines.append("\nButtons:")
+    for btn in page_context["buttons"]:
+        ctx_lines.append(f"  - {btn['text']!r} type={btn['type']!r}")
+
+    # build action history
+    history_lines = ["Actions taken so far:"] if history else ["No actions taken yet."]
+    for i, h in enumerate(history, 1):
+        history_lines.append(f"  {i}. {h['tool']}({h['params']}) → {h['result']}")
+
+    user_message = f"""TASK: {task}
+
+CURRENT PAGE STATE:
+{chr(10).join(ctx_lines)}
+
+{chr(10).join(history_lines)}
+
+What should you do next? Remember: respond with ONLY valid JSON."""
+
+    log("LLM", f"Asking {LLM_MODEL} for next action...")
+
+    response = llm.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_message},
+        ],
+        temperature=0.1,   # low temperature = more predictable JSON output
+        max_tokens=300,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    log("LLM", f"Response: {raw}")
+
+    # strip markdown code fences if the model adds them anyway
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # if the LLM gives bad JSON, extract the first {...} block manually
+        import re
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise ValueError(f"LLM returned non-JSON response: {raw}")
+
+
+# =============================================================================
+# MAIN AGENT LOOP — START → THINK → TOOL → OBSERVE → OUTPUT
+# =============================================================================
 
 async def run_agent():
-    log("START", "Website Automation Agent is starting up")
+    log("START", "=== AI-Driven Website Automation Agent ===")
+    log("START", f"LLM Model  : {LLM_MODEL}")
     log("START", f"Target URL : {TARGET_URL}")
     log("START", f"Fill Name  : {FILL_NAME}")
     log("START", f"Fill Desc  : {FILL_DESC}")
     print()
 
-    async with async_playwright() as pw:
+    # the task description the LLM gets every step
+    task = (
+        f"Navigate to {TARGET_URL}. "
+        f"Find the form on the page and fill in: "
+        f"Name/Username field with '{FILL_NAME}' and "
+        f"Description/Bio field with '{FILL_DESC}'. "
+        f"Then click the Submit button."
+    )
 
-        # STEP 1: Launch the browser
-        log("THINK", "Step 1 — Open a browser window")
+    async with async_playwright() as pw:
         browser, page = await open_browser(pw)
 
         try:
-            # STEP 2: Go to the target URL
-            log("THINK", "Step 2 — Navigate to the target page")
-            await navigate_to_url(page, TARGET_URL)
+            # take an initial screenshot before starting the loop
+            await take_screenshot(page, "00_start")
+
+            # navigate to the target URL first (we always do this manually)
+            nav_result = await navigate_to_url(page, TARGET_URL)
             await take_screenshot(page, "01_page_loaded")
 
-            # STEP 3: Scroll down to find the form preview
-            # The shadcn docs page shows a live form demo somewhere in the middle
-            log("THINK", "Step 3 — Scrolling down to find the form demo area")
-            await scroll(page, 800)
-            await take_screenshot(page, "02_after_scroll")
-
-            # STEP 4: Find the Name input
-            # We try multiple selectors because the page might render differently
-            log("THINK", "Step 4 — Looking for the Name field")
-            name_selectors = [
-                "input[name='username']",              # shadcn form uses name='username' for the Name field
-                "input#name",                          # some versions use id='name'
-                "input[placeholder*='shadcn']",        # placeholder text fallback
-                "form input[type='text']:first-of-type",  # first text input in the form
-                "input[type='text']",                  # last resort — any text input
+            # history of everything the agent has done — LLM reads this each step
+            history = [
+                {"tool": "navigate_to_url", "params": {"url": TARGET_URL}, "result": nav_result}
             ]
-            name_field = await find_element(page, name_selectors, "Name field")
 
-            if name_field:
-                log("THINK", "Step 5 — Clicking the Name field and typing")
-                await name_field.click()
-                await page.wait_for_timeout(300)
-                # triple-click selects all the text so we can overwrite it cleanly
-                await name_field.click(click_count=3)
-                await send_keys(page, FILL_NAME, selector=None)
-                await take_screenshot(page, "03_name_filled")
-                log("OBSERVE", f"Name field filled with: '{FILL_NAME}'")
+            # THE MAIN LOOP
+            for step in range(1, MAX_STEPS + 1):
+                print()
+                log("THINK", f"--- Step {step} of {MAX_STEPS} ---")
+
+                # get the current state of the page
+                page_ctx = await get_page_context(page)
+
+                # ask the LLM what to do
+                action = ask_llm(task, page_ctx, history)
+
+                tool   = action.get("tool", "")
+                params = action.get("params", {})
+                reason = action.get("reasoning", "")
+
+                log("THINK", f"LLM reasoning: {reason}")
+                log("THINK", f"LLM chose: {tool}({params})")
+
+                # execute whichever tool the LLM picked
+                if tool == "done":
+                    log("OUTPUT", f"LLM says we're done: {params.get('message', '')}")
+                    await take_screenshot(page, f"final_done")
+                    break
+
+                elif tool == "navigate_to_url":
+                    result = await navigate_to_url(page, params["url"])
+
+                elif tool == "scroll":
+                    result = await scroll(page, int(params.get("pixels", 400)))
+
+                elif tool == "click_on_screen":
+                    result = await click_on_screen(page, int(params["x"]), int(params["y"]))
+
+                elif tool == "double_click":
+                    result = await double_click(page, int(params["x"]), int(params["y"]))
+
+                elif tool == "send_keys":
+                    result = await send_keys(page, params.get("selector", "input"), params.get("text", ""))
+
+                elif tool == "take_screenshot":
+                    result = await take_screenshot(page, f"step_{step:02d}")
+
+                else:
+                    result = f"Unknown tool: {tool}"
+                    log("ERROR", result)
+
+                # take a screenshot after every action so we can see progress
+                screenshot_path = await take_screenshot(page, f"step_{step:02d}_{tool}")
+
+                # record what happened so the LLM knows next time
+                history.append({
+                    "tool":   tool,
+                    "params": params,
+                    "result": result,
+                })
+
+                log("OBSERVE", f"Result: {result}")
+
+                # small pause between steps
+                await page.wait_for_timeout(800)
+
             else:
-                log("ERROR", "Could not find the Name field — taking screenshot for debugging")
-                await take_screenshot(page, "03_name_not_found")
+                log("ERROR", f"Reached max steps ({MAX_STEPS}) without the LLM calling 'done'.")
 
-            # STEP 5: Find the Description textarea
-            log("THINK", "Step 6 — Looking for the Description field")
-            desc_selectors = [
-                "textarea[name='bio']",              # shadcn form uses name='bio' for the description
-                "textarea#bio",                      # some versions use id='bio'
-                "textarea",                          # any textarea on the page
-                "input[name='description']",         # fallback if it's a plain input
-            ]
-            desc_field = await find_element(page, desc_selectors, "Description field")
-
-            if desc_field:
-                log("THINK", "Step 7 — Clicking the Description field and typing")
-                await desc_field.click()
-                await page.wait_for_timeout(300)
-                await desc_field.click(click_count=3)
-                await send_keys(page, FILL_DESC, selector=None)
-                await take_screenshot(page, "04_desc_filled")
-                log("OBSERVE", f"Description field filled with: '{FILL_DESC}'")
-            else:
-                log("ERROR", "Could not find the Description field — taking screenshot")
-                await take_screenshot(page, "04_desc_not_found")
-
-            # STEP 6: Scroll a bit more so the Submit button is visible
-            log("THINK", "Step 8 — Scrolling to find the Submit button")
-            await scroll(page, 300)
-
-            # STEP 7: Click Submit
-            submit_selectors = [
-                "button[type='submit']",
-                "form button:last-of-type",
-                "button:has-text('Submit')",
-            ]
-            submit_btn = await find_element(page, submit_selectors, "Submit button")
-
-            if submit_btn:
-                log("THINK", "Step 9 — Clicking Submit button")
-                await submit_btn.click()
-                await page.wait_for_timeout(1500)
-                await take_screenshot(page, "05_after_submit")
-                log("OBSERVE", "Form submitted!")
-            else:
-                log("ERROR", "Could not find submit button")
-                await take_screenshot(page, "05_submit_not_found")
-
-            # STEP 8: Done!
             print()
-            log("OUTPUT", "Agent finished successfully!")
+            log("OUTPUT", "Agent finished!")
             log("OUTPUT", f"Screenshots saved in: ./{SCREENSHOTS_DIR}/")
+            log("OUTPUT", f"Total LLM calls made: {len(history)}")
             print()
 
         except Exception as err:
-            log("ERROR", f"Something went wrong: {err}")
+            log("ERROR", f"Agent crashed: {err}")
             await take_screenshot(page, "error_state")
             raise
 
         finally:
-            # wait a bit before closing so you can see the result
             await page.wait_for_timeout(3000)
             await browser.close()
-            log("OUTPUT", "Browser closed. Agent is done.")
+            log("OUTPUT", "Browser closed.")
 
 
-# entry point — just run the agent
 if __name__ == "__main__":
     asyncio.run(run_agent())
