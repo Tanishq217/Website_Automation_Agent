@@ -178,6 +178,25 @@ async def send_keys(page: Page, selector: str, text: str) -> str:
     return f"FAILED: Could not find any element matching '{selector}' or fallbacks. Try a different selector."
 
 
+async def click_element(page: Page, selector: str) -> str:
+    """
+    Clicks an element found by CSS selector.
+    Used for clicking the Submit button or any other clickable element.
+    """
+    log("TOOL", f"click_element → selector='{selector}'")
+    try:
+        elem = page.locator(selector).first
+        await elem.wait_for(state="visible", timeout=8000)
+        await elem.scroll_into_view_if_needed()
+        await elem.click()
+        await page.wait_for_timeout(1000)
+        log("OBSERVE", f"Clicked element '{selector}' successfully")
+        return f"SUCCESS: Clicked element matching '{selector}'"
+    except Exception as e:
+        log("THINK", f"click_element failed for '{selector}': {e}")
+        return f"FAILED: Could not click '{selector}'. Error: {str(e)[:100]}"
+
+
 # =============================================================================
 # PAGE CONTEXT EXTRACTOR
 # Gets relevant info from the current page to give to the LLM.
@@ -191,6 +210,9 @@ async def get_page_context(page: Page) -> dict:
     - All labels on the page
     - Current scroll position
     This is what the LLM "sees" when deciding what to do.
+
+    NOTE: 'inDOM' means the element exists in the HTML even if you haven't
+    scrolled to it yet. You can still fill it with send_keys using its selector.
     """
     title = await page.title()
     url   = page.url
@@ -199,14 +221,16 @@ async def get_page_context(page: Page) -> dict:
         const result = { inputs: [], labels: [], buttons: [] };
 
         document.querySelectorAll('input, textarea').forEach(el => {
+            const rect = el.getBoundingClientRect();
             result.inputs.push({
                 tag:         el.tagName.toLowerCase(),
                 type:        el.getAttribute('type') || '',
                 name:        el.getAttribute('name') || '',
                 id:          el.id || '',
                 placeholder: el.placeholder || '',
-                value:       el.value || '',
-                visible:     el.offsetParent !== null
+                hasValue:    el.value.length > 0,
+                inViewport:  rect.top >= 0 && rect.bottom <= window.innerHeight,
+                inDOM:       true
             });
         });
 
@@ -248,26 +272,37 @@ async def get_page_context(page: Page) -> dict:
 
 SYSTEM_PROMPT = """You are an expert browser automation agent.
 
-Your job is to complete a given task by controlling a web browser step by step.
+Your job is to complete tasks by controlling a web browser step by step.
 
-You have these tools available:
-- navigate_to_url  : params: { url }
-- scroll           : params: { pixels }  (positive = down, negative = up)
-- click_on_screen  : params: { x, y }   (pixel coordinates)
-- double_click     : params: { x, y }
-- send_keys        : params: { selector, text }  (CSS selector + text to type)
-- take_screenshot  : params: {}
-- done             : params: { message }  (call this when the task is fully complete)
+Available tools:
+- scroll          : params: { pixels }            — scroll the page
+- send_keys       : params: { selector, text }    — type into a form field
+- click_element   : params: { selector }          — click a button/link by CSS selector
+- click_on_screen : params: { x, y }             — click at pixel coordinates
+- double_click    : params: { x, y }             — double-click at coordinates
+- navigate_to_url : params: { url }               — go to a URL
+- take_screenshot : params: {}                    — capture the screen
+- done            : params: { message }           — call ONLY after form is submitted
 
-IMPORTANT RULES:
-1. Always respond with ONLY valid JSON — no markdown, no explanation outside the JSON.
-2. Format: {"reasoning": "...", "tool": "tool_name", "params": {...}}
-3. For send_keys, choose the MOST SPECIFIC CSS selector based on the page elements given.
-   Prefer selectors like input[name='x'] or textarea[id='y'] over generic ones like 'input'.
-4. Scroll down to find elements that might be below the fold.
-5. After filling all required fields, click the submit button.
-6. Once the form is submitted, call the done tool.
-7. If a send_keys attempt failed (you'll see FAILED in the result), try a different selector.
+CRITICAL RULES — read carefully:
+1. ONLY respond with valid JSON. No extra text, no markdown fences.
+   Format: {"reasoning": "one sentence", "tool": "tool_name", "params": {...}}
+
+2. ALL inputs listed to you EXIST IN THE DOM. You can fill them with send_keys
+   even if they say 'not in viewport'. Do NOT keep scrolling once you see inputs listed.
+
+3. Build CSS selectors from the input attributes shown:
+   name='username' on an <input>  → use selector "input[name='username']"
+   name='bio' on a <textarea>     → use selector "textarea[name='bio']"
+   no name but it's a textarea    → use selector "textarea"
+
+4. Order of operations:
+   a) Fill the Name/Username field with send_keys
+   b) Fill the Description/Bio field with send_keys
+   c) Click the Submit button with click_element using selector "button[type='submit']"
+   d) Call done
+
+5. If send_keys returns FAILED, try a simpler selector on the next step.
 """
 
 def ask_llm(task: str, page_context: dict, history: list) -> dict:
@@ -281,13 +316,14 @@ def ask_llm(task: str, page_context: dict, history: list) -> dict:
         f"URL: {page_context['url']}",
         f"Scroll position: {page_context['scroll_y']}px",
         "",
-        "Form inputs and textareas found on page:",
+        "Inputs/textareas found in page DOM (inDOM=True means you CAN fill them with send_keys):",
     ]
     for el in page_context["inputs"]:
-        visible = "visible" if el["visible"] else "not visible (below fold)"
+        viewport_note = "in viewport" if el.get("inViewport") else "not in viewport but EXISTS IN DOM"
+        filled_note   = " [ALREADY HAS VALUE]" if el.get("hasValue") else " [EMPTY - needs filling]"
         ctx_lines.append(
-            f"  - <{el['tag']}> type={el['type']!r} name={el['name']!r} "
-            f"id={el['id']!r} placeholder={el['placeholder']!r} ({visible})"
+            f"  - <{el['tag']}> name={el['name']!r} id={el['id']!r} "
+            f"placeholder={el['placeholder']!r} ({viewport_note}){filled_note}"
         )
 
     ctx_lines.append("\nLabels:")
@@ -377,6 +413,12 @@ async def run_agent():
             nav_result = await navigate_to_url(page, TARGET_URL)
             await take_screenshot(page, "01_page_loaded")
 
+            # scroll down a fixed amount first so the form demo is in a reasonable area
+            # the shadcn page has a long doc above the live demo
+            log("THINK", "Pre-scrolling to bring form area into range...")
+            await scroll(page, 600)
+            await take_screenshot(page, "01b_pre_scroll")
+
             # history of everything the agent has done — LLM reads this each step
             history = [
                 {"tool": "navigate_to_url", "params": {"url": TARGET_URL}, "result": nav_result}
@@ -417,6 +459,9 @@ async def run_agent():
 
                 elif tool == "double_click":
                     result = await double_click(page, int(params["x"]), int(params["y"]))
+
+                elif tool == "click_element":
+                    result = await click_element(page, params.get("selector", "button"))
 
                 elif tool == "send_keys":
                     result = await send_keys(page, params.get("selector", "input"), params.get("text", ""))
