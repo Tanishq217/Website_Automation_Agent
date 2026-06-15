@@ -1,13 +1,12 @@
 /**
- * Website Automation Agent — AI-Driven, JavaScript Version
- * ----------------------------------------------------------
- * Same logic as agent.py but written in Node.js.
+ * Website Automation Agent - JavaScript Version
+ * -----------------------------------------------
+ * Same logic as agent.py but written in Node.js with Playwright.
  *
- * The LLM (meta/llama-3.1-8b via NVIDIA NIM) reads the page DOM
- * at each step and decides what to do next.
- * No selectors are hardcoded — the AI figures them out.
+ * The agent reads the page DOM at each step, asks an LLM what to do,
+ * and then does it. No selectors are hardcoded in the code.
  *
- * Run with: node agent.js
+ * Run: node agent.js
  */
 
 import { chromium, firefox, webkit } from 'playwright';
@@ -16,46 +15,48 @@ import OpenAI from 'openai';
 import dotenv from 'dotenv';
 dotenv.config();
 
-const NVIDIA_API_KEY = process.env.NVIDIA_API_KEY;
-const LLM_MODEL      = process.env.LLM_MODEL      || 'meta/llama-3.1-8b-instruct';
-const TARGET_URL     = process.env.TARGET_URL      || 'https://ui.shadcn.com/docs/forms/react-hook-form';
-const FILL_NAME      = process.env.FILL_NAME       || 'Tanishq Singh';
-const FILL_DESC      = process.env.FILL_DESCRIPTION || 'Auto-filled by AI agent!';
-const BROWSER_TYPE   = process.env.BROWSER         || 'chromium';
-const HEADLESS       = process.env.HEADLESS        === 'true';
-const TIMEOUT_MS     = parseInt(process.env.TIMEOUT || '30000', 10);
-const MAX_STEPS      = parseInt(process.env.MAX_STEPS || '20', 10);
+const NVIDIA_API_KEY  = process.env.NVIDIA_API_KEY;
+const LLM_MODEL       = process.env.LLM_MODEL       || 'meta/llama-3.3-70b-instruct';
+const TARGET_URL      = process.env.TARGET_URL       || 'https://ui.shadcn.com/docs/forms/react-hook-form';
+const FILL_NAME       = process.env.FILL_NAME        || 'Tanishq Singh';
+const FILL_DESC       = process.env.FILL_DESCRIPTION || 'Auto-filled by an AI agent!';
+const BROWSER_TYPE    = process.env.BROWSER          || 'chromium';
+const HEADLESS        = process.env.HEADLESS         === 'true';
+const TIMEOUT_MS      = parseInt(process.env.TIMEOUT   || '30000', 10);
+const MAX_STEPS       = parseInt(process.env.MAX_STEPS || '20',    10);
 const SCREENSHOTS_DIR = 'screenshots';
 
 await mkdir(SCREENSHOTS_DIR, { recursive: true });
 
 if (!NVIDIA_API_KEY) {
-    console.error('[ERROR] NVIDIA_API_KEY not found in .env');
+    console.error('[ERROR] NVIDIA_API_KEY is missing from .env');
     process.exit(1);
 }
 
-// NVIDIA NIM is OpenAI-compatible, so we just point the client at their URL
+// NVIDIA NIM uses the same API format as OpenAI, just a different base URL
 const llm = new OpenAI({
     baseURL: 'https://integrate.api.nvidia.com/v1',
     apiKey:  NVIDIA_API_KEY,
 });
 
 
-// ---- logging ----------------------------------------------------------------
+// --- colored terminal output ---
 
 function log(tag, message) {
     const ts = new Date().toLocaleTimeString('en-GB');
     const colors = {
-        START:   '\x1b[96m', THINK: '\x1b[93m', LLM: '\x1b[35m',
-        TOOL:    '\x1b[92m', OBSERVE: '\x1b[94m',
-        ERROR:   '\x1b[91m', OUTPUT: '\x1b[95m',
+        START:   '\x1b[96m', THINK:   '\x1b[93m', LLM:    '\x1b[35m',
+        TOOL:    '\x1b[92m', OBSERVE: '\x1b[94m', ERROR:  '\x1b[91m',
+        OUTPUT:  '\x1b[95m',
     };
     const reset = '\x1b[0m';
     console.log(`[${ts}] ${colors[tag] || ''}[${tag}]${reset}  ${message}`);
 }
 
 
-// ---- tools ------------------------------------------------------------------
+// =============================================================================
+// TOOLS
+// =============================================================================
 
 async function take_screenshot(page, label = 'step') {
     const path = `${SCREENSHOTS_DIR}/${label}_${Date.now()}.png`;
@@ -80,7 +81,7 @@ async function open_browser() {
 async function navigate_to_url(page, url) {
     log('TOOL', `navigate_to_url → ${url}`);
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(2500); // wait for JS to finish rendering
     const title = await page.title();
     log('OBSERVE', `Loaded: ${title}`);
     return `Navigated to ${url}. Page title: ${title}`;
@@ -111,7 +112,7 @@ async function double_click(page, x, y) {
 async function send_keys(page, selector, text) {
     log('TOOL', `send_keys → selector='${selector}' text='${text}'`);
 
-    // try LLM's selector first, then fallbacks
+    // try what the LLM suggested first, then simpler fallbacks
     const fallbacks = [selector];
     if (selector.toLowerCase().includes('input'))    fallbacks.push("input[type='text']", 'input');
     if (selector.toLowerCase().includes('textarea')) fallbacks.push('textarea');
@@ -120,21 +121,41 @@ async function send_keys(page, selector, text) {
         try {
             const elem = page.locator(sel).first();
             await elem.waitFor({ state: 'visible', timeout: 5000 });
-            await elem.click({ clickCount: 3 });
+            await elem.click({ clickCount: 3 }); // select existing text first
             await page.waitForTimeout(200);
-            await page.keyboard.type(text, { delay: 50 });
+            await page.keyboard.type(text, { delay: 50 }); // type with delay
             await page.waitForTimeout(300);
-            log('OBSERVE', `Typed into '${sel}' successfully`);
+            log('OBSERVE', `Typed into '${sel}'`);
             return `SUCCESS: Typed '${text}' into element matching '${sel}'`;
         } catch {
-            log('THINK', `Selector '${sel}' failed — trying next`);
+            log('THINK', `Selector '${sel}' failed, trying next`);
         }
     }
-    return `FAILED: Could not find any element matching '${selector}' or fallbacks.`;
+    return `FAILED: Could not find element matching '${selector}'. Try a different selector.`;
+}
+
+async function click_element(page, selector) {
+    // scrolls the element into view then clicks it - used for Submit buttons
+    log('TOOL', `click_element → selector='${selector}'`);
+    try {
+        const elem = page.locator(selector).first();
+        await elem.waitFor({ state: 'visible', timeout: 8000 });
+        await elem.scrollIntoViewIfNeeded();
+        await elem.click();
+        await page.waitForTimeout(1000);
+        log('OBSERVE', `Clicked '${selector}'`);
+        return `SUCCESS: Clicked element matching '${selector}'`;
+    } catch (e) {
+        log('THINK', `click_element failed for '${selector}': ${e.message}`);
+        return `FAILED: Could not click '${selector}'. Error: ${e.message.substring(0, 100)}`;
+    }
 }
 
 
-// ---- page context extractor -------------------------------------------------
+// =============================================================================
+// PAGE CONTEXT
+// Reads all form elements from the page so the LLM knows what's there.
+// =============================================================================
 
 async function get_page_context(page) {
     const title   = await page.title();
@@ -147,13 +168,14 @@ async function get_page_context(page) {
         const buttons = [];
 
         document.querySelectorAll('input, textarea').forEach(el => {
+            const rect = el.getBoundingClientRect();
             inputs.push({
                 tag:         el.tagName.toLowerCase(),
-                type:        el.getAttribute('type') || '',
                 name:        el.getAttribute('name') || '',
                 id:          el.id || '',
                 placeholder: el.placeholder || '',
-                visible:     el.offsetParent !== null,
+                hasValue:    el.value.length > 0,
+                inViewport:  rect.top >= 0 && rect.bottom <= window.innerHeight,
             });
         });
 
@@ -178,41 +200,56 @@ async function get_page_context(page) {
 }
 
 
-// ---- LLM decision maker -----------------------------------------------------
+// =============================================================================
+// LLM INTEGRATION
+// Sends the page state to the LLM and gets back a tool call as JSON.
+// =============================================================================
 
-const SYSTEM_PROMPT = `You are an expert browser automation agent.
+const SYSTEM_PROMPT = `You are a browser automation agent.
 
 Your job is to complete a given task by controlling a web browser step by step.
 
-You have these tools available:
-- navigate_to_url  : params: { url }
-- scroll           : params: { pixels }  (positivef = down, negative = up)
-- click_on_screen  : params: { x, y }   (pixel coordinates)
-- double_click     : params: { x, y }
-- send_keys        : params: { selector, text }  (CSS selector + text to type)
-- take_screenshot  : params: {}
-- done             : params: { message }  (call this when the task is fully complete)
+Available tools:
+- scroll          : params: { pixels }            - scroll the page
+- send_keys       : params: { selector, text }    - type into a form field
+- click_element   : params: { selector }          - click a button by CSS selector
+- click_on_screen : params: { x, y }             - click at pixel coordinates
+- double_click    : params: { x, y }             - double-click at coordinates
+- navigate_to_url : params: { url }               - go to a URL
+- take_screenshot : params: {}                    - capture the screen
+- done            : params: { message }           - call this after the form is submitted
 
-IMPORTANT RULES:
-1. Always respond with ONLY valid JSON — no markdown, no explanation outside JSON.
-2. Format: {"reasoning": "...", "tool": "tool_name", "params": {...}}
-3. For send_keys, pick the MOST SPECIFIC selector from the page elements listed.
-4. Scroll down to find elements that might be below the fold.
-5. After filling all fields, click Submit, then call done.
-6. If send_keys returned FAILED, try a different selector.`;
+Rules:
+1. Only respond with valid JSON. No extra text.
+   Format: {"reasoning": "one sentence", "tool": "tool_name", "params": {...}}
+
+2. All inputs shown to you exist in the page DOM. Fill them with send_keys
+   even if they say 'not in viewport'. Do not keep scrolling if inputs are listed.
+
+3. Build CSS selectors from the input attributes:
+   name='username' on an input  -> use "input[name='username']"
+   name='bio' on a textarea     -> use "textarea[name='bio']"
+   textarea with no name        -> use "textarea"
+
+4. Order: fill Name, fill Description, click Submit button, call done.
+
+5. If send_keys returns FAILED, try a simpler selector next time.`;
+
 
 async function ask_llm(task, pageCtx, history) {
+    // describe all the form elements on the page
     const inputList = pageCtx.inputs.map(el =>
-        `  - <${el.tag}> type=${JSON.stringify(el.type)} name=${JSON.stringify(el.name)} ` +
-        `id=${JSON.stringify(el.id)} placeholder=${JSON.stringify(el.placeholder)} ` +
-        `(${el.visible ? 'visible' : 'not visible'})`
+        `  - <${el.tag}> name=${JSON.stringify(el.name)} id=${JSON.stringify(el.id)} ` +
+        `placeholder=${JSON.stringify(el.placeholder)} ` +
+        `(${el.inViewport ? 'in viewport' : 'not in viewport but in DOM'})` +
+        `${el.hasValue ? ' [has value]' : ' [empty]'}`
     ).join('\n');
 
     const labelList  = pageCtx.labels.map(l  => `  - ${JSON.stringify(l.text)} for=${JSON.stringify(l.htmlFor)}`).join('\n');
     const buttonList = pageCtx.buttons.map(b => `  - ${JSON.stringify(b.text)} type=${b.type}`).join('\n');
     const histList   = history.length
         ? history.map((h, i) => `  ${i + 1}. ${h.tool}(${JSON.stringify(h.params)}) → ${h.result}`).join('\n')
-        : '  No actions taken yet.';
+        : '  No actions yet.';
 
     const userMessage = `TASK: ${task}
 
@@ -221,8 +258,8 @@ Title: ${pageCtx.title}
 URL: ${pageCtx.url}
 Scroll position: ${pageCtx.scroll_y}px
 
-Form inputs and textareas:
-${inputList || '  (none found — try scrolling)'}
+Form elements found (all exist in DOM):
+${inputList || '  (none found)'}
 
 Labels:
 ${labelList || '  (none found)'}
@@ -235,7 +272,7 @@ ${histList}
 
 What should you do next? Respond with ONLY valid JSON.`;
 
-    log('LLM', `Asking ${LLM_MODEL} for next action...`);
+    log('LLM', `Asking ${LLM_MODEL} what to do...`);
 
     const response = await llm.chat.completions.create({
         model:       LLM_MODEL,
@@ -243,21 +280,21 @@ What should you do next? Respond with ONLY valid JSON.`;
             { role: 'system', content: SYSTEM_PROMPT },
             { role: 'user',   content: userMessage },
         ],
-        temperature: 0.1,
+        temperature: 0.1,  // low = consistent JSON output
         max_tokens:  300,
     });
 
     let raw = response.choices[0].message.content.trim();
     log('LLM', `Response: ${raw}`);
 
-    // strip markdown fences if model adds them
+    // remove markdown code fences if the model includes them
     if (raw.startsWith('```')) {
         raw = raw.split('```')[1];
         if (raw.startsWith('json')) raw = raw.slice(4);
         raw = raw.trim();
     }
 
-    // try to extract JSON if there's extra text
+    // extract just the JSON object in case there's extra text
     const match = raw.match(/\{[\s\S]*\}/);
     if (match) raw = match[0];
 
@@ -265,19 +302,23 @@ What should you do next? Respond with ONLY valid JSON.`;
 }
 
 
-// ---- main agent loop --------------------------------------------------------
+// =============================================================================
+// MAIN LOOP
+// At each step: read page → ask LLM → run tool → repeat
+// =============================================================================
 
 async function run_agent() {
-    log('START', '=== AI-Driven Website Automation Agent (JS) ===');
-    log('START', `LLM Model  : ${LLM_MODEL}`);
+    log('START', 'Website Automation Agent starting');
+    log('START', `Model      : ${LLM_MODEL}`);
     log('START', `Target URL : ${TARGET_URL}`);
     log('START', `Fill Name  : ${FILL_NAME}`);
     log('START', `Fill Desc  : ${FILL_DESC}`);
     console.log();
 
-    const task = `Navigate to ${TARGET_URL}. Find the form on the page and fill in: ` +
-                 `Name/Username field with '${FILL_NAME}' and Description/Bio field with '${FILL_DESC}'. ` +
-                 `Then click the Submit button.`;
+    const task = `Navigate to ${TARGET_URL}. Find the form and fill: ` +
+                 `Name/Username field with '${FILL_NAME}', ` +
+                 `Description/Bio field with '${FILL_DESC}'. ` +
+                 `Then click Submit.`;
 
     const { browser, page } = await open_browser();
 
@@ -286,26 +327,43 @@ async function run_agent() {
         const navResult = await navigate_to_url(page, TARGET_URL);
         await take_screenshot(page, '01_page_loaded');
 
+        // scroll to bring form into view before starting the LLM loop
+        log('THINK', 'Scrolling to form area...');
+        await scroll(page, 800);
+        await page.waitForTimeout(1000);
+
+        try {
+            const firstInput = page.locator('input, textarea').first();
+            await firstInput.scrollIntoViewIfNeeded();
+            await page.waitForTimeout(500);
+            log('OBSERVE', 'Form inputs now in viewport');
+        } catch {
+            log('THINK', 'Could not scroll input into view, continuing anyway');
+        }
+
+        await take_screenshot(page, '01b_form_visible');
+
+        // history tracks every action so the LLM has full context each step
         const history = [
             { tool: 'navigate_to_url', params: { url: TARGET_URL }, result: navResult }
         ];
 
         for (let step = 1; step <= MAX_STEPS; step++) {
             console.log();
-            log('THINK', `--- Step ${step} of ${MAX_STEPS} ---`);
+            log('THINK', `Step ${step} of ${MAX_STEPS}`);
 
             const pageCtx = await get_page_context(page);
             const action  = await ask_llm(task, pageCtx, history);
 
             const { tool, params = {}, reasoning = '' } = action;
 
-            log('THINK', `LLM reasoning: ${reasoning}`);
-            log('THINK', `LLM chose: ${tool}(${JSON.stringify(params)})`);
+            log('THINK', `Reasoning: ${reasoning}`);
+            log('THINK', `Action: ${tool}(${JSON.stringify(params)})`);
 
             let result;
 
             if (tool === 'done') {
-                log('OUTPUT', `LLM says done: ${params.message || ''}`);
+                log('OUTPUT', `Task complete: ${params.message || ''}`);
                 await take_screenshot(page, 'final_done');
                 break;
             } else if (tool === 'navigate_to_url') {
@@ -316,6 +374,8 @@ async function run_agent() {
                 result = await click_on_screen(page, params.x, params.y);
             } else if (tool === 'double_click') {
                 result = await double_click(page, params.x, params.y);
+            } else if (tool === 'click_element') {
+                result = await click_element(page, params.selector || 'button');
             } else if (tool === 'send_keys') {
                 result = await send_keys(page, params.selector, params.text);
             } else if (tool === 'take_screenshot') {
@@ -332,13 +392,13 @@ async function run_agent() {
         }
 
         console.log();
-        log('OUTPUT', 'Agent finished!');
+        log('OUTPUT', 'Agent done.');
         log('OUTPUT', `Screenshots saved in: ./${SCREENSHOTS_DIR}/`);
-        log('OUTPUT', `Total LLM calls made: ${history.length}`);
+        log('OUTPUT', `LLM calls made: ${history.length}`);
         console.log();
 
     } catch (err) {
-        log('ERROR', `Agent crashed: ${err.message}`);
+        log('ERROR', `Something went wrong: ${err.message}`);
         await take_screenshot(page, 'error_state');
         throw err;
     } finally {
