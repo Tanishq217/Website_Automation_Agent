@@ -413,11 +413,23 @@ async def run_agent():
             nav_result = await navigate_to_url(page, TARGET_URL)
             await take_screenshot(page, "01_page_loaded")
 
-            # scroll down a fixed amount first so the form demo is in a reasonable area
-            # the shadcn page has a long doc above the live demo
-            log("THINK", "Pre-scrolling to bring form area into range...")
-            await scroll(page, 600)
-            await take_screenshot(page, "01b_pre_scroll")
+            # scroll down to bring the form demo into view
+            # 800px puts us past the intro docs and into the live demo section
+            log("THINK", "Pre-scrolling to bring form into viewport...")
+            await scroll(page, 800)
+            await page.wait_for_timeout(1000)
+
+            # try to scroll the first input into view so it's definitely visible
+            # this way the LLM sees 'inViewport: true' and knows to fill it
+            try:
+                first_input = page.locator("input, textarea").first
+                await first_input.scroll_into_view_if_needed()
+                await page.wait_for_timeout(500)
+                log("OBSERVE", "Scrolled first input into viewport")
+            except Exception:
+                log("THINK", "Could not pre-scroll input into view — LLM will handle")
+
+            await take_screenshot(page, "01b_form_in_view")
 
             # history of everything the agent has done — LLM reads this each step
             history = [
