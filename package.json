@@ -1,7 +1,7 @@
 {
   "name": "website-automation-agent",
   "version": "1.0.0",
-  "description": "Browser automation agent that fills forms using Playwright",
+  "description": "Browser automation agent that fills web forms using Playwright and an LLM",
   "type": "module",
   "main": "agent.js",
   "scripts": {
@@ -10,9 +10,10 @@
   },
   "dependencies": {
     "dotenv": "^17.4.2",
+    "openai": "^4.0.0",
     "playwright": "^1.49.0"
   },
-  "keywords": ["automation", "playwright", "ai-agent", "browser"],
+  "keywords": ["automation", "playwright", "browser", "llm"],
   "author": "Tanishq Singh",
   "license": "ISC"
 }
